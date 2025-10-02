@@ -24,6 +24,11 @@ const ExoplanetFinder = () => {
   const [aiPredictions, setAiPredictions] = useState({});
   const [spectralAnalysis, setSpectralAnalysis] = useState({});
 
+  // Spectroscopy pie data fetched from NASA Exoplanet Archive Firefly (stable data)
+  const [spectroscopyPieData, setSpectroscopyPieData] = useState(null);
+  const [spectroscopyLoading, setSpectroscopyLoading] = useState(false);
+  const [spectroscopyError, setSpectroscopyError] = useState(null);
+
   // Space Telescopes and Observatories Database
   const telescopes = {
     hubble: {
@@ -116,12 +121,25 @@ const ExoplanetFinder = () => {
     { name: 'Gemini Observatory', location: 'Hawaii/Chile', type: 'Optical/IR', discoveries: 340, status: 'Active', efficiency: 93.4 }
   ];
 
-  // Seeded random for stable generation
+  // Seeded random for stability (used heavily in data generation)
   const seededRandom = (seed) => {
     let s = seed;
     return () => {
       s = (s * 9301 + 49297) % 233280;
       return s / 233280;
+    };
+  };
+
+  // Small seeded-from-string PRNG for deterministic UI fallbacks (stable per planet)
+  const seededRandomFromString = (str) => {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < str.length; i++) {
+      h = Math.imul(h ^ str.charCodeAt(i), 16777619);
+    }
+    let seed = h >>> 0;
+    return () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return (seed & 0xfffffff) / 0xfffffff;
     };
   };
 
@@ -335,8 +353,84 @@ const ExoplanetFinder = () => {
       } catch (err) {
         console.error('Spectroscopy AI error:', err);
       }
+    } else {
+      setSpectralAnalysis({});
     }
   }, [selectedPlanet]);
+
+  // Fetch stable spectroscopy summary data from NASA Exoplanet Archive Firefly endpoint
+  useEffect(() => {
+    let mounted = true;
+    const FIRE_FLY_URL = 'https://exoplanetarchive.ipac.caltech.edu/cgi-bin/atmospheres/nph-firefly?atmospheres&format=json';
+    const knownMolecules = ['H2O', 'CO2', 'CH4', 'O2', 'NH3', 'CO', 'H2', 'He', 'N2'];
+
+    const parseRecordsForMolecules = (records) => {
+      // records expected to be array of objects; we scan string values for molecule names
+      const counts = {};
+      knownMolecules.forEach(m => counts[m] = 0);
+      records.forEach(rec => {
+        Object.values(rec).forEach(val => {
+          if (!val) return;
+          const s = String(val).toUpperCase();
+          knownMolecules.forEach(mol => {
+            // match whole word or simple substring (robust against formats)
+            if (s.includes(mol)) counts[mol] += 1;
+          });
+        });
+      });
+      // Build pie array (only keep molecules with counts > 0)
+      const pie = Object.entries(counts)
+        .filter(([, c]) => c > 0)
+        .map(([name, value]) => ({ name, value }));
+      return pie.length ? pie : null;
+    };
+
+    const fetchData = async () => {
+      setSpectroscopyLoading(true);
+      setSpectroscopyError(null);
+      try {
+        const res = await fetch(FIRE_FLY_URL, {cache: 'force-cache'});
+        if (!res.ok) throw new Error(`Firefly fetch failed: ${res.status}`);
+        const data = await res.json();
+        // Firefly returns an object with "data" or array directly; handle both
+        let records = Array.isArray(data) ? data : data.data || data.table || [];
+        if (!Array.isArray(records)) records = [];
+        const pie = parseRecordsForMolecules(records);
+        if (mounted) {
+          if (pie) {
+            setSpectroscopyPieData(pie);
+          } else {
+            // fallback: try scanning CSV if JSON payload empty/unexpected - attempt text parse
+            const text = await res.text();
+            // naive CSV fallback
+            const lines = text.split('\n').filter(Boolean);
+            if (lines.length > 1) {
+              const headers = lines[0].split(',');
+              const csvRecords = lines.slice(1).map(l => {
+                const cols = l.split(',');
+                const obj = {};
+                headers.forEach((h, i) => obj[h.trim()] = (cols[i] || '').trim());
+                return obj;
+              });
+              const pie2 = parseRecordsForMolecules(csvRecords);
+              setSpectroscopyPieData(pie2 || null);
+            } else {
+              setSpectroscopyPieData(null);
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Spectroscopy fetch error:', err);
+        if (mounted) setSpectroscopyError(err.message);
+      } finally {
+        if (mounted) setSpectroscopyLoading(false);
+      }
+    };
+
+    fetchData();
+
+    return () => { mounted = false; };
+  }, []);
 
   // Real-time data simulation (continued)
   // Filtered planets
@@ -673,6 +767,58 @@ const ExoplanetFinder = () => {
   };
 
   const spectroscopyData = selectedPlanet ? ExoplanetSpectroscopy.generateRealSpectroscopicData(selectedPlanet) : [];
+
+  // Deterministic atmospheric profile for RadarChart:
+  // - Prefer real per-planet atmosphereComposition if available
+  // - Fallback to spectralAnalysis.molecularConfidence if present
+  // - Final fallback: seeded deterministic pseudo-random values based on planet id/name
+  const atmosphericProfile = useMemo(() => {
+    const species = ['H2O', 'CO2', 'CH4', 'N2', 'O2', 'H2', 'He', 'NH3', 'CO'];
+    const defaultVal = 20; // baseline
+    if (!selectedPlanet) {
+      return species.map(s => ({ subject: s, A: defaultVal }));
+    }
+
+    const comp = selectedPlanet.atmosphereComposition || {};
+    const mconf = spectralAnalysis?.molecularConfidence || {};
+    const seedStr = `${selectedPlanet.name}-${selectedPlanet.id || 0}`;
+    const rand = seededRandomFromString(seedStr);
+
+    // Normalize keys of atmosphereComposition (e.g., "H2/He" -> keys might be "H2" and "He")
+    const normalizedComp = {};
+    Object.entries(comp).forEach(([k, v]) => {
+      // split by non-alphanumeric characters and map
+      const parts = k.split(/[^A-Za-z0-9]+/).filter(Boolean);
+      if (parts.length === 1) normalizedComp[parts[0].toUpperCase()] = Number(v);
+      else {
+        const share = Number(v) / parts.length;
+        parts.forEach(p => normalizedComp[p.toUpperCase()] = (normalizedComp[p.toUpperCase()] || 0) + share);
+      }
+    });
+
+    return species.map(s => {
+      const key = s.toUpperCase();
+      let val = defaultVal;
+
+      if (normalizedComp[key] !== undefined) {
+        // map to 0..100, clamp
+        val = Math.min(100, Math.max(0, Math.round(Number(normalizedComp[key]))));
+        // small floor to ensure visibility in radar
+        val = Math.max(5, val);
+      } else if (mconf[key] !== undefined) {
+        // confidence 0..1 -> 0..100
+        val = Math.min(100, Math.round(Number(mconf[key]) * 100));
+        val = Math.max(5, val);
+      } else {
+        // deterministic fallback per-planet + species
+        const pseudo = rand(); // deterministic per planet
+        // map pseudo [0,1) to 10..85
+        val = Math.round(10 + pseudo * 75);
+      }
+
+      return { subject: s, A: val };
+    });
+  }, [selectedPlanet, spectralAnalysis]);
 
   const getTypeClass = (type) => {
     switch (type) {
@@ -1559,27 +1705,28 @@ const ExoplanetFinder = () => {
                     </div>
                   </div>
 
+                  {/* Replaced Planet Classifications pie with Spectroscopic Detections pie fed from NASA Exoplanet Archive Firefly */}
                   <div className="bg-white/5 backdrop-blur-md rounded-2xl border border-white/10 p-6 shadow-xl">
                     <h3 className="text-xl font-bold text-white mb-6 text-center flex items-center justify-center gap-2">
                       <Globe className="w-6 h-6 text-blue-400" />
-                      Planet Classifications
+                      Spectroscopic Detections (stable data)
                     </h3>
                     <div className="h-80">
                       <ResponsiveContainer width="100%" height="100%">
                         <PieChart>
                           <Pie
-                            data={planetTypeStats}
+                            data={spectroscopyPieData || planetTypeStats}
                             cx="50%"
                             cy="50%"
                             innerRadius={40}
                             outerRadius={120}
                             fill="#8884d8"
                             dataKey="value"
-                            label={({name, percent}) => `${(percent * 100).toFixed(0)}%`}
+                            label={({name, percent}) => `${name} ${(percent * 100).toFixed(0)}%`}
                             labelLine={false}
                           >
-                            {planetTypeStats.map((entry, index) => (
-                              <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                            {(spectroscopyPieData || planetTypeStats).map((entry, index) => (
+                              <Cell key={`cell-spec-${index}`} fill={COLORS[index % COLORS.length]} />
                             ))}
                           </Pie>
                           <Tooltip 
@@ -1589,12 +1736,16 @@ const ExoplanetFinder = () => {
                               borderRadius: '8px',
                               color: '#fff'
                             }}
+                            formatter={(value, name) => {
+                              // show raw counts when spectroscopyPieData present
+                              return [value, name];
+                            }}
                           />
                         </PieChart>
                       </ResponsiveContainer>
                     </div>
                     <div className="mt-4 space-y-2">
-                      {planetTypeStats.map((entry, index) => (
+                      {(spectroscopyPieData || planetTypeStats).map((entry, index) => (
                         <div key={entry.name} className="flex items-center justify-between text-sm">
                           <div className="flex items-center gap-2">
                             <div 
@@ -1606,6 +1757,11 @@ const ExoplanetFinder = () => {
                           <span className="text-white font-semibold">{entry.value.toLocaleString()}</span>
                         </div>
                       ))}
+                      {spectroscopyLoading && <div className="text-xs text-gray-400 mt-2">Loading spectroscopy summary...</div>}
+                      {spectroscopyError && <div className="text-xs text-red-400 mt-2">Spectroscopy fetch error: {spectroscopyError}</div>}
+                      {!spectroscopyLoading && !spectroscopyPieData && !spectroscopyError && (
+                        <div className="text-xs text-gray-400 mt-2">No spectroscopy summary found — showing fallback dataset.</div>
+                      )}
                     </div>
                   </div>
 
@@ -1897,14 +2053,7 @@ const ExoplanetFinder = () => {
                             </h4>
                             <div className="h-64">
                               <ResponsiveContainer width="100%" height="100%">
-                                <RadarChart data={[
-                                  { subject: 'H2O', A: selectedPlanet.atmosphere === 'H2O' ? 95 : 20 + Math.random() * 30 },
-                                  { subject: 'CO2', A: selectedPlanet.atmosphere === 'CO2' ? 90 : 15 + Math.random() * 40 },
-                                  { subject: 'CH4', A: selectedPlanet.atmosphere === 'CH4' ? 85 : 10 + Math.random() * 25 },
-                                  { subject: 'N2', A: selectedPlanet.atmosphere === 'N2' ? 92 : 25 + Math.random() * 45 },
-                                  { subject: 'O2', A: selectedPlanet.atmosphere === 'O2' ? 80 : 5 + Math.random() * 20 },
-                                  { subject: 'H2', A: selectedPlanet.atmosphere === 'H2' ? 88 : 30 + Math.random() * 60 }
-                                ]}>
+                                <RadarChart data={atmosphericProfile}>
                                   <PolarGrid stroke="#ffffff30" />
                                   <PolarAngleAxis dataKey="subject" tick={{ fill: '#fff', fontSize: 12 }} />
                                   <PolarRadiusAxis tick={{ fill: '#fff', fontSize: 10 }} tickCount={4} />
